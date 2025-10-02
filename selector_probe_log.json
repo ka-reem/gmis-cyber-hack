@@ -1,0 +1,56 @@
+[
+  {
+    "selector": "//div[@id=\"challenge\"]//a/small",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "div#challenge a small",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "main button",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "main a",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "div.challenge a",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "div.challenge button",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "button:has-text(\"Open\")",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "button:has-text(\"Details\")",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  },
+  {
+    "selector": "xpath=//button[contains(@class, \"challenge\")]",
+    "found_count": 0,
+    "clickable_count": 0,
+    "error": null
+  }
+]
