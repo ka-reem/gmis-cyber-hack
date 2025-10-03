@@ -13,6 +13,12 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 from openai import OpenAI
 from dotenv import load_dotenv
+import re
+from collections import Counter
+import math
+
+# Default index to start clicking from (0-based). Change this value to start anywhere.
+DEFAULT_START_INDEX = 60
 
 # Load environment variables from .env file
 load_dotenv()
@@ -141,6 +147,158 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
         except Exception as e:
             print(f"⚠️ Error extracting question: {e}")
             return f"Error: {e}"
+
+    def is_flag_like_question(self, text: str) -> bool:
+        """Heuristic: return True if the question looks like a decoding/flag-format task."""
+        if not text:
+            return False
+        t = text.lower()
+        keywords = [
+            'decode', 'decoding', 'base64', 'hex', 'rot13', 'flag', 'cipher', 'ciphertext',
+            'answer example', 'example format', 'flag format', 'encoded'
+        ]
+        for k in keywords:
+            if k in t:
+                return True
+        # also consider short indicator patterns like strings with lots of equals (base64)
+        if re.search(r"[A-Za-z0-9+/]{8,}={0,2}", text):
+            return True
+        return False
+
+    def extract_required_prefix_from_question(self, text: str):
+        """Try to extract a required prefix (like 'CAHSI-') from the question text.
+
+        Returns the prefix including the trailing hyphen (e.g. 'CAHSI-') or None.
+        """
+        if not text:
+            return None
+
+        # Look for explicit 'Answer Example Format' lines
+        m = re.search(r'Answer Example Format\s*[:\-]?\s*([A-Za-z0-9\-_]+-[A-Za-z0-9\-_]+)', text, re.IGNORECASE)
+        if m:
+            s = m.group(1)
+            if '-' in s:
+                return s.split('-')[0] + '-'
+            return s
+
+        # Prefer explicit CAHSI- prefix when present
+        m2 = re.search(r'\b(CAHSI-)', text)
+        if m2:
+            return m2.group(1)
+
+        # Generic uppercase prefix followed by hyphen
+        m3 = re.search(r'\b([A-Z]{2,10}-)', text)
+        if m3:
+            return m3.group(1)
+
+        return None
+
+    async def submit_answer(self, page, answer: str) -> bool:
+        """Attempt to fill and submit an answer inside the currently open modal.
+
+        Returns True if it appears we submitted something, False otherwise.
+        """
+        try:
+            # Common selectors for inputs inside modals
+            input_selectors = [
+                'input[type="text"]',
+                'input[name="submission"]',
+                'input[name="answer"]',
+                'textarea',
+                'input[placeholder*="flag"]',
+                'input[placeholder*="answer"]',
+                'textarea[placeholder*="flag"]',
+                'input[class*="answer"]',
+                'xpath=//input',
+                'xpath=//textarea',
+            ]
+
+            for sel in input_selectors:
+                try:
+                    el = page.locator(sel).first
+                    # Some locators may not exist; check count
+                    if await el.count() == 0:
+                        continue
+                    if not await el.is_visible(timeout=500):
+                        continue
+                    await el.fill(answer)
+
+                    # Try to find a submit button
+                    submit_btn = page.locator('button:has-text("Submit"), button:has-text("submit"), button[type="submit"], button:has-text("Answer")').first
+                    if await submit_btn.count() and await submit_btn.is_visible(timeout=500):
+                        await submit_btn.click()
+                        await page.wait_for_timeout(500)
+                        print(f"[ACTION] Submitted answer using button for selector {sel}")
+                        return True
+
+                    # Otherwise press Enter in the input
+                    try:
+                        await el.press('Enter')
+                        await page.wait_for_timeout(500)
+                        print(f"[ACTION] Submitted answer by pressing Enter in field {sel}")
+                        return True
+                    except Exception:
+                        pass
+
+                except Exception:
+                    continue
+
+            print('[WARN] No input/submit button found inside modal to submit answer')
+            return False
+
+        except Exception as e:
+            print(f"[ERROR] submit_answer error: {e}")
+            return False
+
+    def is_answer_related(self, question: str, answer: str) -> bool:
+        """Lightweight relatedness heuristic:
+
+        - Tokenize question and answer, remove short stopwords
+        - If there is token overlap above a small threshold, consider related
+        - If question contains explicit decoding keywords, prefer that answer decodes to expected pattern via prefix checks
+        - Return False for trivial mismatches (empty, NO_ANSWER, Error)
+        """
+        if not question or not answer:
+            return False
+        a = answer.strip()
+        if a in ('NO_ANSWER', ''):
+            return False
+
+        # Normalize and tokenize
+        def tokenize(s):
+            s = s.lower()
+            s = re.sub(r"[^a-z0-9\-\s]", ' ', s)
+            tokens = [t for t in s.split() if len(t) > 2]
+            return tokens
+
+        q_tokens = tokenize(question)
+        a_tokens = tokenize(a)
+        if not q_tokens or not a_tokens:
+            return False
+
+        q_counts = Counter(q_tokens)
+        a_counts = Counter(a_tokens)
+
+        # Count overlap
+        overlap = sum((q_counts & a_counts).values())
+        overlap_score = overlap / max(1, len(q_tokens))
+
+        # If overlap is at least 20% of question tokens, accept
+        if overlap_score >= 0.20:
+            return True
+
+        # If question looks like decoding and answer contains uncommon flag-like token, accept
+        if self.is_flag_like_question(question):
+            # flag-like: contains uppercase-hyphen or common flag prefix
+            if re.search(r"[A-Z]{2,10}-[A-Za-z0-9_-]{4,}", a):
+                return True
+
+        # If a long substring of answer appears in question (or vice versa), accept
+        if len(a) > 6 and a.lower() in question.lower():
+            return True
+
+        # otherwise reject
+        return False
 
     async def close_any_modal(self, page, get_question=False):
         """Try a comprehensive list of selectors to close any modal/dialog that opened."""
@@ -272,7 +430,12 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
             return
 
         # Click each element
-        for i in range(total):
+        # Start index support: use self.start_index if set, else DEFAULT_START_INDEX
+        start_index = getattr(self, 'start_index', None)
+        if start_index is None:
+            start_index = DEFAULT_START_INDEX
+
+        for i in range(start_index, total):
             try:
                 element = clickable.nth(i)
                 
@@ -295,14 +458,41 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
                 # Wait for modal to appear
                 await page.wait_for_timeout(500)
 
-                # Extract question and get AI answer
+                # Extract question and decide whether to ask AI
                 question = await self.extract_question_from_modal(page)
-                print(f"📝 Question extracted: {question[:200]}...")
-                
-                if self.ai_client and question and "Could not extract" not in question:
-                    answer = await self.get_ai_answer(question)
-                    print(f"💬 AI suggests: {answer}")
-                    # TODO: You can add logic here to input the answer if needed
+                print(f"[INFO] Question extracted: {question[:200]}...")
+
+                # Decide if this looks like a decoding/flag question
+                if not self.is_flag_like_question(question):
+                    print("[SKIP] Not a flag/decoding question — skim")
+                else:
+                    # Try to find required prefix (e.g., CAHSI-)
+                    prefix = self.extract_required_prefix_from_question(question)
+                    if prefix:
+                        print(f"[INFO] Detected required prefix: {prefix}")
+
+                    if self.ai_client:
+                        answer = await self.get_ai_answer(question)
+                        print(f"[AI] Suggests: {answer}")
+
+                        # Respect explicit NO_ANSWER token from model
+                        if answer == 'NO_ANSWER':
+                            print('[SKIP] AI returned NO_ANSWER — skipping submission')
+                        elif prefix and not answer.startswith(prefix):
+                            print(f"[SKIP] AI answer does not start with required prefix '{prefix}' — not submitting")
+                        else:
+                            # Basic sanity: ensure answer is single-line and not too long
+                            single_line = answer.splitlines()[0].strip()
+                            if len(single_line) > 512:
+                                print('[WARN] AI answer unusually long — skipping')
+                            else:
+                                submitted = await self.submit_answer(page, single_line)
+                                if submitted:
+                                    print(f"[ACTION] Submitted answer: {single_line}")
+                                else:
+                                    print('[WARN] Could not submit answer automatically')
+                    else:
+                        print('[SKIP] AI client not initialized; cannot attempt answer')
                 
                 # Try to close modal
                 closed = await self.close_any_modal(page, get_question=False)
@@ -332,7 +522,11 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
             
         print(f"🧭 Found {count} elements for selector")
 
-        for i in range(count):
+        # Start index support: use self.start_index if set, else DEFAULT_START_INDEX
+        start_index = getattr(self, 'start_index', None)
+        if start_index is None:
+            start_index = DEFAULT_START_INDEX
+        for i in range(start_index, count):
             try:
                 el = elements.nth(i)
                 if not await el.is_visible():
@@ -413,6 +607,21 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
                             delay_ms = int(sys.argv[i + 1])
                         except Exception:
                             delay_ms = 0
+
+                # Optional start index (0-based) via CLI. If not provided, leave
+                # self.start_index as None so DEFAULT_START_INDEX (the constant)
+                # is used by the click helpers.
+                start_index_cli = None
+                for i, arg in enumerate(sys.argv):
+                    if arg in ("--start", "--index") and i + 1 < len(sys.argv):
+                        try:
+                            start_index_cli = int(sys.argv[i + 1])
+                        except Exception:
+                            start_index_cli = 0
+
+                # Only set attribute if CLI provided a value; otherwise keep it None
+                self.start_index = (max(0, start_index_cli)
+                                    if start_index_cli is not None else None)
 
                 # Click elements using selector or default strategy
                 if selector:
