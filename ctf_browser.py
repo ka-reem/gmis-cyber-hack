@@ -8,8 +8,14 @@ between runs by saving browser state (cookies, localStorage, etc.).
 
 import asyncio
 import sys
+import os
 from pathlib import Path
 from playwright.async_api import async_playwright
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class CTFBrowser:
@@ -20,6 +26,64 @@ class CTFBrowser:
         
         # Create state directory if it doesn't exist
         self.state_dir.mkdir(exist_ok=True)
+        
+        # Initialize OpenAI client
+        self.ai_client = None
+        try:
+            api_key = os.environ.get("LLAMA_API_KEY")
+            if api_key:
+                self.ai_client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://api.llama.com/compat/v1/"
+                )
+                print(f"[AI] Initialized (key: {api_key[:10]}...)")
+            else:
+                print("[WARN] LLAMA_API_KEY not found in .env file - AI answering disabled")
+                print("[INFO] Create a .env file with: LLAMA_API_KEY=your_key_here")
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize AI client: {e}")
+    
+    async def get_ai_answer(self, question_text: str) -> str:
+        """Use AI to answer a CTF question"""
+        if not self.ai_client:
+            return "AI client not initialized"
+        
+        try:
+            print(f"[AI] Asking: {question_text[:100]}...")
+            completion = self.ai_client.chat.completions.create(
+                model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a CTF (Capture The Flag) expert assistant.
+
+CRITICAL INSTRUCTIONS:
+1. Think through the problem step-by-step internally.
+2. Pay very close attention to the "Answer Example Format" in the question.
+3. Determine whether the candidate answer is directly related to the question.
+   - If the answer is NOT clearly related, the model MUST output the single token: NO_ANSWER
+4. Output ONLY the final answer in the EXACT format specified by the question (one line only).
+5. Do NOT include any explanation, reasoning, or extra text.
+6. If the question involves decoding (base64, hex, etc.), perform the decoding and format the decoded value exactly.
+
+Examples:
+- If format is "CAHSI-ABCDE12345", answer must be like "CAHSI-ABCDE12345" matching format rules shown.
+- If decoding base64 yields "CAHSI-ABCDE12345", output exactly: CAHSI-ABCDE12345
+
+If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
+                    },
+                    {
+                        "role": "user",
+                        "content": question_text
+                    }
+                ],
+            )
+            answer = completion.choices[0].message.content.strip()
+            print(f"[AI] Answer: {answer}")
+            return answer
+        except Exception as e:
+            print(f"[ERROR] AI error: {e}")
+            return f"Error: {e}"
     
     async def launch_browser_with_state(self, playwright):
         """Launch browser and load saved state if available"""
@@ -38,7 +102,47 @@ class CTFBrowser:
         
         return browser, context
 
-    async def close_any_modal(self, page):
+    async def extract_question_from_modal(self, page) -> str:
+        """Extract question text from the opened modal/dialog"""
+        try:
+            # Wait a moment for modal to render
+            await page.wait_for_timeout(500)
+            
+            # Try common selectors for question/challenge content
+            question_selectors = [
+                '.modal-body',
+                '[role="dialog"]',
+                '.challenge-description',
+                '.question',
+                '#challenge .description',
+                'div.modal-content',
+            ]
+            
+            for selector in question_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if await element.is_visible(timeout=1000):
+                        text = await element.inner_text()
+                        if text and len(text.strip()) > 10:  # Valid question should have some content
+                            return text.strip()
+                except Exception:
+                    continue
+            
+            # Fallback: get all text from modal/dialog
+            try:
+                modal = page.locator('[role="dialog"], .modal').first
+                if await modal.is_visible(timeout=1000):
+                    return await modal.inner_text()
+            except Exception:
+                pass
+            
+            return "Could not extract question text"
+            
+        except Exception as e:
+            print(f"⚠️ Error extracting question: {e}")
+            return f"Error: {e}"
+
+    async def close_any_modal(self, page, get_question=False):
         """Try a comprehensive list of selectors to close any modal/dialog that opened."""
         close_selectors = [
             # Common close button text
@@ -189,17 +293,26 @@ class CTFBrowser:
                 await element.click(timeout=5000)
 
                 # Wait for modal to appear
-                await page.wait_for_timeout(500)  # Reduced from 1s
+                await page.wait_for_timeout(500)
 
+                # Extract question and get AI answer
+                question = await self.extract_question_from_modal(page)
+                print(f"📝 Question extracted: {question[:200]}...")
+                
+                if self.ai_client and question and "Could not extract" not in question:
+                    answer = await self.get_ai_answer(question)
+                    print(f"💬 AI suggests: {answer}")
+                    # TODO: You can add logic here to input the answer if needed
+                
                 # Try to close modal
-                closed = await self.close_any_modal(page)
+                closed = await self.close_any_modal(page, get_question=False)
                 if closed:
                     print(f"✅ Closed modal for: {desc}")
                 else:
                     print(f"⚠️ No modal found after clicking: {desc}")
                 
                 # Small delay between clicks
-                await page.wait_for_timeout(300)  # Reduced from 500ms
+                await page.wait_for_timeout(300)
 
             except Exception as e:
                 print(f"❌ Failed to click element #{i}: {e}")

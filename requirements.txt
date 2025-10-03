@@ -1,2 +1,3 @@
 playwright==1.47.0
-asyncio
+openai
+python-dotenv
