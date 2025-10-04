@@ -11,16 +11,17 @@ import sys
 import os
 from pathlib import Path
 from playwright.async_api import async_playwright
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 import re
 from collections import Counter
 import math
+import base64
 
 # Default index to start clicking from (0-based). Change this value to start anywhere.
-DEFAULT_START_INDEX = 60
+DEFAULT_START_INDEX = 58
 
-# Load environment variables from .env file
+# Load environment variables from .env file (kept for compatibility)
 load_dotenv()
 
 
@@ -33,63 +34,126 @@ class CTFBrowser:
         # Create state directory if it doesn't exist
         self.state_dir.mkdir(exist_ok=True)
         
-        # Initialize OpenAI client
-        self.ai_client = None
+        # Initialize optional LLM client (used only for validation/suggestions)
+        self.llm_client = None
         try:
             api_key = os.environ.get("LLAMA_API_KEY")
             if api_key:
-                self.ai_client = OpenAI(
-                    api_key=api_key,
-                    base_url="https://api.llama.com/compat/v1/"
-                )
-                print(f"[AI] Initialized (key: {api_key[:10]}...)")
+                self.llm_client = OpenAI(api_key=api_key, base_url="https://api.llama.com/compat/v1/")
+                print(f"[AI] LLM initialized")
             else:
-                print("[WARN] LLAMA_API_KEY not found in .env file - AI answering disabled")
-                print("[INFO] Create a .env file with: LLAMA_API_KEY=your_key_here")
+                print("[INFO] LLAMA_API_KEY not set — LLM validation disabled")
         except Exception as e:
-            print(f"[ERROR] Failed to initialize AI client: {e}")
+            print(f"[WARN] Failed to init LLM client: {e}")
     
-    async def get_ai_answer(self, question_text: str) -> str:
-        """Use AI to answer a CTF question"""
-        if not self.ai_client:
-            return "AI client not initialized"
+    # ---- Decoding-based helpers (replace LLM flow) ----
+    def extract_encoded_token(self, text: str):
+        """Extract the base64 token from question text.
         
+        Expected pattern: "message: <TOKEN>" where TOKEN is the encoded string
+        and TOKEN ends at newline or "Answer Example Format".
+        """
+        if not text:
+            return None
+        
+        # Look for pattern: "message:" followed by base64-like token
+        # Token is alphanumeric+/+ with optional = padding
+        m = re.search(r'message:\s*([A-Za-z0-9+/]+=*)', text, re.IGNORECASE)
+        if m:
+            token = m.group(1).strip()
+            # Clean up: remove trailing non-base64 chars if any
+            token = re.sub(r'[^A-Za-z0-9+/=]+$', '', token)
+            return token
+        
+        return None
+
+    def try_base64_decode(self, s: str):
+        """Try to base64-decode s and return decoded str on success or None."""
         try:
-            print(f"[AI] Asking: {question_text[:100]}...")
-            completion = self.ai_client.chat.completions.create(
+            decoded_bytes = base64.b64decode(s, validate=True)
+            decoded = decoded_bytes.decode('utf-8')
+            return decoded
+        except Exception:
+            return None
+
+    def llm_is_word(self, candidate: str) -> bool:
+        """Ask the LLM whether candidate is a single English word. Returns True if yes."""
+        if not self.llm_client or not candidate:
+            return False
+        try:
+            prompt = (
+                "You are a terse assistant. Reply with exactly one token: YES if the following"
+                " string is a valid English word, or NO otherwise. Do NOT add any explanation.\n\n"
+                f"String: {candidate}\n"
+            )
+            resp = self.llm_client.chat.completions.create(
                 model="Llama-4-Maverick-17B-128E-Instruct-FP8",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": """You are a CTF (Capture The Flag) expert assistant.
-
-CRITICAL INSTRUCTIONS:
-1. Think through the problem step-by-step internally.
-2. Pay very close attention to the "Answer Example Format" in the question.
-3. Determine whether the candidate answer is directly related to the question.
-   - If the answer is NOT clearly related, the model MUST output the single token: NO_ANSWER
-4. Output ONLY the final answer in the EXACT format specified by the question (one line only).
-5. Do NOT include any explanation, reasoning, or extra text.
-6. If the question involves decoding (base64, hex, etc.), perform the decoding and format the decoded value exactly.
-
-Examples:
-- If format is "CAHSI-ABCDE12345", answer must be like "CAHSI-ABCDE12345" matching format rules shown.
-- If decoding base64 yields "CAHSI-ABCDE12345", output exactly: CAHSI-ABCDE12345
-
-If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
-                    },
-                    {
-                        "role": "user",
-                        "content": question_text
-                    }
+                    {"role": "system", "content": "You must reply with exactly YES or NO, nothing else."},
+                    {"role": "user", "content": prompt}
                 ],
             )
-            answer = completion.choices[0].message.content.strip()
-            print(f"[AI] Answer: {answer}")
-            return answer
-        except Exception as e:
-            print(f"[ERROR] AI error: {e}")
-            return f"Error: {e}"
+            out_raw = resp.choices[0].message.content.strip()
+            out = out_raw.splitlines()[0].strip().upper()
+            # Accept only exact YES
+            return out == 'YES'
+        except Exception:
+            return False
+
+    def llm_suggest_candidate(self, original_encoded: str) -> str:
+        """Ask the LLM to attempt alternative decodings/transforms on the original encoded token and
+        return a single candidate token (single line) that looks like an English word, or NO_CANDIDATE.
+        """
+        if not self.llm_client or not original_encoded:
+            return 'NO_CANDIDATE'
+        try:
+            system = "You are an assistant that suggests a single candidate English word by trying common decodings (base64, hex, rot13, URL, etc.) from a provided encoded token. Reply with one token (the candidate) or NO_CANDIDATE."
+            user = (
+                f"Original encoded token: {original_encoded}\n\n"
+                "Try common decoding/transformation strategies and return the single best candidate word you find, or NO_CANDIDATE if none."
+            )
+            resp = self.llm_client.chat.completions.create(
+                model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=64,
+            )
+            raw = resp.choices[0].message.content.strip()
+            # Log raw response for debugging
+            print(f"[AI] raw suggestion: {raw}")
+            if not raw:
+                return 'NO_CANDIDATE'
+            # Extract a single token-like candidate (letters/digits/_/-) with length >=4
+            m = re.search(r'([A-Za-z0-9_-]{4,})', raw)
+            if m:
+                return m.group(1)
+            return 'NO_CANDIDATE'
+        except Exception:
+            return 'NO_CANDIDATE'
+
+    def decode_try_double(self, s: str):
+        """Attempt single decode; if it fails or result looks still encoded, try decode again."""
+        first = self.try_base64_decode(s)
+        if first:
+            # If first decode looks readable (contains spaces or letters), return it
+            if re.search(r"[A-Za-z0-9\s\-_,.:;@()]+", first):
+                return first
+            # Otherwise, perhaps it's still base64: try decode again
+            second = self.try_base64_decode(first)
+            if second:
+                return second
+            return first
+
+        # If single decode failed, try decode after stripping padding or trying common transforms
+        try_variants = [s.strip(), s.replace('\n', ''), s.rstrip('=') + '==']
+        for v in try_variants:
+            d = self.try_base64_decode(v)
+            if d:
+                return d
+
+        return None
     
     async def launch_browser_with_state(self, playwright):
         """Launch browser and load saved state if available"""
@@ -193,6 +257,65 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
 
         return None
 
+    async def decode_and_submit_from_question(self, page, question: str):
+        """Extract encoded token from question, decode in a loop until LLM validates it as a word, then submit.
+
+        Returns True if a submission was performed, False otherwise.
+        """
+        encoded_token = self.extract_encoded_token(question)
+        if not encoded_token:
+            print('[SKIP] No encoded token found in question (expected after "message:")')
+            return False
+
+        print(f'[INFO] Extracted encoded token: {encoded_token[:80]}...')
+        
+        # Decode in a loop until the result starts with "CAHSI"
+        current = encoded_token
+        max_iterations = 10
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f'[INFO] Decode iteration {iteration}: attempting base64 decode...')
+            
+            decoded = self.try_base64_decode(current)
+            if not decoded:
+                print(f'[SKIP] Base64 decode failed at iteration {iteration}')
+                return False
+            
+            decoded = decoded.strip()
+            print(f'[INFO] Decoded to: {decoded[:100]}')
+            
+            # Check if decoded string starts with "CAHSI"
+            if decoded.startswith('CAHSI'):
+                print(f'[ACTION] Found CAHSI prefix after {iteration} iterations!')
+                candidate = decoded
+                break
+            else:
+                # Not starting with CAHSI yet, decode again
+                print(f'[INFO] Does not start with CAHSI yet; will decode again')
+                current = decoded
+        else:
+            # Loop exhausted without finding CAHSI prefix
+            print(f'[SKIP] Reached max iterations ({max_iterations}) without finding CAHSI prefix')
+            return False
+        
+        # Validate candidate before submission
+        if not re.search(r'[A-Za-z0-9]', candidate):
+            print('[SKIP] Final candidate is empty or non-alphanumeric')
+            return False
+        
+        # Submit the decoded value AS-IS (already has CAHSI- prefix)
+        final = candidate
+        print(f'[ACTION] Final decoded payload for submission: {final}')
+        submitted = await self.submit_answer(page, final)
+        if submitted:
+            print(f'[ACTION] Submitted decoded flag: {final}')
+            return True
+        else:
+            print('[WARN] Submission failed')
+            return False
+
     async def submit_answer(self, page, answer: str) -> bool:
         """Attempt to fill and submit an answer inside the currently open modal.
 
@@ -213,35 +336,74 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
                 'xpath=//textarea',
             ]
 
-            for sel in input_selectors:
+            # Prefer inputs inside the modal/dialog context
+            containers = [
+                page.locator('#challenge').first,
+                page.locator('[role="dialog"]').first,
+                page.locator('.modal').first,
+            ]
+
+            # Build list of visible containers (async checks)
+            use_containers = []
+            for c in containers:
                 try:
-                    el = page.locator(sel).first
-                    # Some locators may not exist; check count
-                    if await el.count() == 0:
-                        continue
-                    if not await el.is_visible(timeout=500):
-                        continue
-                    await el.fill(answer)
-
-                    # Try to find a submit button
-                    submit_btn = page.locator('button:has-text("Submit"), button:has-text("submit"), button[type="submit"], button:has-text("Answer")').first
-                    if await submit_btn.count() and await submit_btn.is_visible(timeout=500):
-                        await submit_btn.click()
-                        await page.wait_for_timeout(500)
-                        print(f"[ACTION] Submitted answer using button for selector {sel}")
-                        return True
-
-                    # Otherwise press Enter in the input
-                    try:
-                        await el.press('Enter')
-                        await page.wait_for_timeout(500)
-                        print(f"[ACTION] Submitted answer by pressing Enter in field {sel}")
-                        return True
-                    except Exception:
-                        pass
-
+                    cnt = await c.count()
+                    if cnt and await c.is_visible(timeout=200):
+                        use_containers.append(c)
                 except Exception:
                     continue
+
+            # If no visible container, fall back to whole page
+            if not use_containers:
+                use_containers = [page]
+
+            for sel in input_selectors:
+                for container in use_containers:
+                    try:
+                        el = container.locator(sel).first
+                        # Some locators may not exist; check count
+                        if await el.count() == 0:
+                            continue
+                        if not await el.is_visible(timeout=500):
+                            continue
+
+                        print(f"[DEBUG] Filling selector {sel} inside container with: {answer}")
+                        await el.fill(answer)
+
+                        # Verify value was set
+                        try:
+                            current = await el.input_value()
+                        except Exception:
+                            current = None
+
+                        if current is None or current.strip() == '':
+                            print(f"[WARN] After fill, input value is empty for selector {sel} (got: {current})")
+                            continue
+
+                        # Try to find a submit button inside the same container first
+                        submit_btn = container.locator('button:has-text("Submit"), button:has-text("submit"), button[type="submit"], button:has-text("Answer")').first
+                        if await submit_btn.count() and await submit_btn.is_visible(timeout=500):
+                            await submit_btn.click()
+                            await page.wait_for_timeout(500)
+                            print(f"[ACTION] Submitted answer using button for selector {sel}")
+                            return True
+
+                        # Otherwise press Enter in the input (ensure focus)
+                        try:
+                            await el.focus()
+                            await el.press('Enter')
+                            await page.wait_for_timeout(500)
+                            print(f"[ACTION] Submitted answer by pressing Enter in field {sel}")
+                            return True
+                        except Exception as e:
+                            print(f"[WARN] Could not submit by Enter for {sel}: {e}")
+                            continue
+
+                    except Exception as e:
+                        # continue to next container/selector
+                        # print debug for visibility
+                        # print(f"[DEBUG] selector {sel} in container error: {e}")
+                        continue
 
             print('[WARN] No input/submit button found inside modal to submit answer')
             return False
@@ -471,28 +633,10 @@ If you cannot produce a related answer, respond exactly with: NO_ANSWER"""
                     if prefix:
                         print(f"[INFO] Detected required prefix: {prefix}")
 
-                    if self.ai_client:
-                        answer = await self.get_ai_answer(question)
-                        print(f"[AI] Suggests: {answer}")
-
-                        # Respect explicit NO_ANSWER token from model
-                        if answer == 'NO_ANSWER':
-                            print('[SKIP] AI returned NO_ANSWER — skipping submission')
-                        elif prefix and not answer.startswith(prefix):
-                            print(f"[SKIP] AI answer does not start with required prefix '{prefix}' — not submitting")
-                        else:
-                            # Basic sanity: ensure answer is single-line and not too long
-                            single_line = answer.splitlines()[0].strip()
-                            if len(single_line) > 512:
-                                print('[WARN] AI answer unusually long — skipping')
-                            else:
-                                submitted = await self.submit_answer(page, single_line)
-                                if submitted:
-                                    print(f"[ACTION] Submitted answer: {single_line}")
-                                else:
-                                    print('[WARN] Could not submit answer automatically')
-                    else:
-                        print('[SKIP] AI client not initialized; cannot attempt answer')
+                    # Use decoding-based approach instead of LLM
+                    did_submit = await self.decode_and_submit_from_question(page, question)
+                    if not did_submit:
+                        print('[SKIP] No decoded submission made')
                 
                 # Try to close modal
                 closed = await self.close_any_modal(page, get_question=False)
